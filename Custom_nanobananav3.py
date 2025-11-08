@@ -13,7 +13,9 @@ class NanoBananaAPINode_V2:
     This node supports:
     - Text and System Prompts
     - Up to 5 reference images (standard generation)
-    - 1 Image + Mask (for Visual Editing / Inpainting) <--- NEW FEATURE
+    - 1 Image + Mask (for Visual Editing / Inpainting)
+    - All image inputs enabled at all times
+    - Natural language labels for all inputs (e.g., "image 1", "mask")
     - Model version selection
     - Batch generation (candidateCount)
     - Full control over Safety Settings
@@ -58,7 +60,7 @@ class NanoBananaAPINode_V2:
                 "mask": ("MASK",),
                 # Image 1 is now the primary image for both modes
                 "image_1": ("IMAGE",), 
-                # Remaining images are only used when edit_mode_enabled is "no"
+                # Remaining images are now ALWAYS enabled
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
@@ -113,6 +115,7 @@ class NanoBananaAPINode_V2:
         except Exception as e:
             print(f"[NanoBanana Node] Error converting tensor to base64: {e}")
             return None
+            
     # --- base64_to_tensor is UNCHANGED ---
     def base64_to_tensor(self, base64_data):
         """
@@ -131,8 +134,8 @@ class NanoBananaAPINode_V2:
     def generate_image_batch(self, api_key, model_version, prompt, system_prompt, aspect_ratio, 
                              seed, temperature, top_p, candidate_count,
                              safety_harassment, safety_hate_speech, safety_sexual, safety_dangerous,
-                             edit_mode_enabled, # <--- NEW INPUT
-                             mask=None, # <--- NEW INPUT
+                             edit_mode_enabled, # <--- INPUT
+                             mask=None, # <--- INPUT
                              image_1=None, image_2=None, image_3=None, image_4=None, image_5=None):
         """
         The main execution function of the node.
@@ -153,85 +156,75 @@ class NanoBananaAPINode_V2:
         if system_prompt and system_prompt.strip() and system_prompt.lower() != "you are a helpful image generation assistant.":
             full_prompt = f"{system_prompt}\n\nUser: {prompt}"
             
+        # Start the parts list with the main prompt
         parts = [{"text": full_prompt}]
         
         print(f"[NanoBanana Node] Using model: {model_version}")
-        #print(f"[NanoBanana Node] Final Text Prompt (with system): {full_prompt}")
         
         image_count = 0
         
-        # --- NEW LOGIC START: Handle Edit Mode ---
+        # --- NEW LOGIC START: Sequentially add all inputs with labels ---
         is_edit_mode = edit_mode_enabled == "yes"
-        print(f"[NanoBanana Node] Edit Mode Enabled: {is_edit_mode}")
+        print(f"[NanoBanana Node] Edit Mode Enabled (for mask): {is_edit_mode}")
         
         # A. Handle Primary Image (image_1)
         if image_1 is not None:
             b64_image = self.tensor_to_base64(image_1)
             if b64_image:
-                # Add image_1 as the "originalImage" or a reference image
-                image_part_config = {
+                # Add the new natural language label first
+                parts.append({"text": "image 1"}) 
+                # Then add the image data
+                parts.append({
                     "inlineData": {
                         "mimeType": "image/png",
                         "data": b64_image
                     }
-                }
-                
-                # In Edit Mode, image_1 needs a special role 'originalImage'
-                if is_edit_mode:
-                    # NOTE: The Gemini API expects the original image to be of type 'image' 
-                    #       and the mask to be of type 'mask' in the payload. 
-                    #       The role is implied by the 'mask' part being present, but we add the image as the first part.
-                    parts.append(image_part_config)
-                    image_count += 1
-                    print("[NanoBanana Node] Added image_1 (Original Image for Editing) to request.")
-                else:
-                    # In normal mode, it's just a reference image
-                    parts.append(image_part_config)
-                    image_count += 1
-                    print("[NanoBanana Node] Added image_1 (Reference Image) to request.")
+                })
+                image_count += 1
+                print("[NanoBanana Node] Added 'image 1' (with label) to request.")
             else:
                 return (dummy_image, "ERROR: Failed to encode input image_1.")
 
-        # B. Handle Mask (Only in Edit Mode)
+        # B. Handle Mask (Only if Edit Mode is 'yes' AND mask is provided)
         if is_edit_mode and mask is not None:
             b64_mask = self.tensor_to_base64(mask)
             if b64_mask:
-                # Add the mask as a separate part with mimeType 'mask'
-                # The 'mask' content type is critical for Visual Editing
+                # Add the new natural language label for the mask
+                parts.append({"text": "mask for image 1"})
+                # Then add the mask data
                 parts.append({
                     "inlineData": {
-                        "mimeType": "image/png", # <--- FIX: Use image/png for the mask
+                        "mimeType": "image/png", # Use image/png for the mask
                         "data": b64_mask
                     }
                 })
-                print("[NanoBanana Node] Added Mask for Visual Editing.")
+                print("[NanoBanana Node] Added 'mask' (with label) for Visual Editing.")
             else:
                 return (dummy_image, "ERROR: Failed to encode input mask.")
 
-        # C. Handle Remaining Reference Images (Only in Normal Mode)
-        if not is_edit_mode:
-            image_inputs_refs = [image_2, image_3, image_4, image_5]
-            for i, img_tensor in enumerate(image_inputs_refs):
-                if img_tensor is not None:
-                    b64_image = self.tensor_to_base64(img_tensor)
-                    if b64_image:
-                        parts.append({
-                            "inlineData": {
-                                "mimeType": "image/png",
-                                "data": b64_image
-                            }
-                        })
-                        image_count += 1
-                        print(f"[NanoBanana Node] Added image_{i+2} (Reference Image) to request.")
-                    else:
-                        return (dummy_image, f"ERROR: Failed to encode input image_{i+2}.")
-        elif is_edit_mode and (image_2 or image_3 or image_4 or image_5):
-            # WARN the user if they connect extra images in edit mode
-            print("[NanoBanana Node] WARNING: In Edit Mode ('yes'), only image_1 and mask are used. Reference images 2-5 are ignored.")
+        # C. Handle Remaining Reference Images (Now runs in ALL modes)
+        image_inputs_refs = [image_2, image_3, image_4, image_5]
+        for i, img_tensor in enumerate(image_inputs_refs):
+            if img_tensor is not None:
+                b64_image = self.tensor_to_base64(img_tensor)
+                if b64_image:
+                    # Add the new natural language label for this image
+                    parts.append({"text": f"image {i+2}"}) 
+                    # Then add the image data
+                    parts.append({
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": b64_image
+                        }
+                    })
+                    image_count += 1
+                    print(f"[NanoBanana Node] Added 'image {i+2}' (with label) to request.")
+                else:
+                    return (dummy_image, f"ERROR: Failed to encode input image_{i+2}.")
         # --- NEW LOGIC END ---
 
         # --- [DEBUG LOG] ---
-        print(f"[NanoBanana Node] Total parts being sent: {len(parts)} (Text + Images/Mask)")
+        print(f"[NanoBanana Node] Total parts being sent: {len(parts)} (Text + Labeled Images/Mask)")
         # --- [END DEBUG LOG] ---
 
         # --- 2. Construct Generation Config ---
